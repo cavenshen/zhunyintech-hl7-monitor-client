@@ -1,0 +1,7 @@
+out/
+*.iml
+.idea/
+data/
+logs/
+config/config.properties
+
