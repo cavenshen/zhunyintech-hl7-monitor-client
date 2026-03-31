@@ -9,6 +9,7 @@ import com.zhunyintech.inmehl7.client.model.Hl7ResultRecord;
 import com.zhunyintech.inmehl7.client.model.MedicalDataItem;
 import com.zhunyintech.inmehl7.client.model.MedicalDataRecord;
 import com.zhunyintech.inmehl7.client.model.OrgInfo;
+import com.zhunyintech.inmehl7.client.ventilator.VentilatorRecordSupport;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -25,8 +26,10 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 
 public class ClientRepository {
 
@@ -270,6 +273,15 @@ public class ClientRepository {
             ps.executeUpdate();
         } catch (SQLException ex) {
             logger.error("saveOrgInfo failed", ex);
+        }
+    }
+
+    public synchronized void clearOrgInfo() {
+        String sql = "DELETE FROM client_org_info";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.executeUpdate();
+        } catch (SQLException ex) {
+            logger.error("clearOrgInfo failed", ex);
         }
     }
 
@@ -558,6 +570,7 @@ public class ClientRepository {
                     records.add(record);
                 }
             }
+            populateRecordSummaries(conn, records);
         } catch (SQLException ex) {
             logger.error("queryRecords failed", ex);
         }
@@ -587,6 +600,7 @@ public class ClientRepository {
                         }
                     }
                 }
+                record.setSummaryText(VentilatorRecordSupport.buildSummary(record));
                 return record;
             }
         } catch (SQLException ex) {
@@ -729,6 +743,51 @@ public class ClientRepository {
                 itemPs.addBatch();
             }
             itemPs.executeBatch();
+        }
+    }
+
+    private void populateRecordSummaries(Connection conn, List<MedicalDataRecord> records) throws SQLException {
+        if (records == null || records.isEmpty()) {
+            return;
+        }
+        Map<Long, MedicalDataRecord> recordMap = new LinkedHashMap<>();
+        for (MedicalDataRecord record : records) {
+            if (record == null || record.getId() <= 0 || !VentilatorRecordSupport.isVentilatorRecord(record)) {
+                continue;
+            }
+            recordMap.put(record.getId(), record);
+        }
+        if (recordMap.isEmpty()) {
+            return;
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT * FROM client_medical_data_item WHERE header_id IN (");
+        boolean first = true;
+        for (int i = 0; i < recordMap.size(); i++) {
+            if (!first) {
+                sql.append(',');
+            }
+            first = false;
+            sql.append('?');
+        }
+        sql.append(") ORDER BY header_id, sort_no, id");
+
+        Map<Long, List<MedicalDataItem>> itemMap = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            int index = 1;
+            for (Long headerId : recordMap.keySet()) {
+                ps.setLong(index++, headerId);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long headerId = rs.getLong("header_id");
+                    itemMap.computeIfAbsent(headerId, ignored -> new ArrayList<>()).add(mapRecordItem(rs));
+                }
+            }
+        }
+        for (Map.Entry<Long, MedicalDataRecord> entry : recordMap.entrySet()) {
+            List<MedicalDataItem> items = itemMap.get(entry.getKey());
+            entry.getValue().setSummaryText(VentilatorRecordSupport.buildSummary(items));
         }
     }
 

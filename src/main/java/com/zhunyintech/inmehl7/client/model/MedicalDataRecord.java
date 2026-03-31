@@ -35,6 +35,7 @@ public class MedicalDataRecord {
     private String rawPayload;
     private String sourceIp;
     private int sourcePort;
+    private String summaryText;
     private List<MedicalDataItem> items = new ArrayList<>();
 
     public long getId() {
@@ -275,6 +276,14 @@ public class MedicalDataRecord {
 
     public void setSourcePort(int sourcePort) {
         this.sourcePort = sourcePort;
+    }
+
+    public String getSummaryText() {
+        return summaryText;
+    }
+
+    public void setSummaryText(String summaryText) {
+        this.summaryText = summaryText;
     }
 
     public List<MedicalDataItem> getItems() {

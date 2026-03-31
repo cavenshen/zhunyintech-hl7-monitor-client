@@ -24,7 +24,11 @@ public class ServerApiClient {
     public ServerApiClient(Config config, RuntimeLogger logger) {
         this.config = config;
         this.logger = logger;
-        this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+        this.httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .version(HttpClient.Version.HTTP_1_1)
+            .build();
         this.mapper = new ObjectMapper().registerModule(new JavaTimeModule());
     }
 
@@ -58,11 +62,13 @@ public class ServerApiClient {
             .POST(HttpRequest.BodyPublishers.ofString(json));
         setTokenHeader(requestBuilder, token);
 
+        logger.info("HTTP POST " + url);
         HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+        logger.info("HTTP POST " + url + " -> " + response.statusCode());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("HTTP " + response.statusCode() + " " + response.body());
+            throw new IOException("POST " + url + " -> HTTP " + response.statusCode() + " " + response.body());
         }
-        return unwrap(response.body());
+        return unwrap(response.body(), "POST " + url);
     }
 
     private JsonNode get(String path, String token) throws IOException, InterruptedException {
@@ -73,19 +79,21 @@ public class ServerApiClient {
             .GET();
         setTokenHeader(requestBuilder, token);
 
+        logger.info("HTTP GET " + url);
         HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+        logger.info("HTTP GET " + url + " -> " + response.statusCode());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("HTTP " + response.statusCode() + " " + response.body());
+            throw new IOException("GET " + url + " -> HTTP " + response.statusCode() + " " + response.body());
         }
-        return unwrap(response.body());
+        return unwrap(response.body(), "GET " + url);
     }
 
-    private JsonNode unwrap(String responseBody) throws IOException {
+    private JsonNode unwrap(String responseBody, String context) throws IOException {
         JsonNode node = mapper.readTree(responseBody);
         JsonNode codeNode = node.get("code");
         if (codeNode != null && codeNode.asInt(-1) != 0) {
             String message = node.has("message") ? node.get("message").asText() : "unknown error";
-            throw new IOException("Server error: " + message);
+            throw new IOException(context + " -> Server error: " + message);
         }
         JsonNode data = node.get("data");
         if (data == null) {
@@ -98,11 +106,49 @@ public class ServerApiClient {
         if (token == null || token.trim().isEmpty()) {
             return;
         }
+        String tokenValue = token.trim();
+        String mode = resolveAuthHeaderMode(tokenValue);
         String headerName = config.get("authHeaderName");
         if (headerName == null || headerName.trim().isEmpty()) {
             headerName = "x-auth-token";
         }
-        builder.header(headerName, token.trim());
+        if ("both".equals(mode)) {
+            builder.header("Authorization", "Bearer " + tokenValue);
+            builder.header(headerName, tokenValue);
+            if (!"x-auth-token".equalsIgnoreCase(headerName)) {
+                builder.header("x-auth-token", tokenValue);
+            }
+            return;
+        }
+        if ("authorization".equals(mode) || "bearer".equals(mode)) {
+            builder.header("Authorization", "Bearer " + tokenValue);
+            return;
+        }
+        builder.header(headerName, tokenValue);
+    }
+
+    private String resolveAuthHeaderMode(String tokenValue) {
+        String mode = config.get("authHeaderMode");
+        String normalized = mode == null ? "" : mode.trim().toLowerCase();
+        if (normalized.isEmpty() || "auto".equals(normalized)) {
+            return looksLikeJwt(tokenValue) ? "authorization" : "x-auth-token";
+        }
+        if ("x_auth_token".equals(normalized) || "xauthtoken".equals(normalized)) {
+            return "x-auth-token";
+        }
+        return normalized;
+    }
+
+    private boolean looksLikeJwt(String tokenValue) {
+        if (tokenValue == null) {
+            return false;
+        }
+        String value = tokenValue.trim();
+        int firstDot = value.indexOf('.');
+        if (firstDot <= 0) {
+            return false;
+        }
+        return value.indexOf('.', firstDot + 1) > firstDot + 1;
     }
 
     private String baseUrl() {
@@ -117,4 +163,3 @@ public class ServerApiClient {
         return base;
     }
 }
-

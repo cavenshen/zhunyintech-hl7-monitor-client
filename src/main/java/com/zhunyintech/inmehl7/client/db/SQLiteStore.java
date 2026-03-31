@@ -380,6 +380,15 @@ public class SQLiteStore {
         return null;
     }
 
+    public void clearAuthToken() {
+        String sql = "DELETE FROM hl7_auth_cache";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.executeUpdate();
+        } catch (SQLException ex) {
+            logger.error("clearAuthToken failed", ex);
+        }
+    }
+
     private Hl7ResultRecord loadRecordByHeaderId(Connection conn, long headerId) throws SQLException {
         String headerSql = "SELECT record_id, message_control_id, sample_no, patient_id, patient_name, result_time, result_type, his_target, his_request_no, raw_message " +
             "FROM hl7_result_header WHERE id=?";
@@ -458,4 +467,3 @@ public class SQLiteStore {
         return LocalDateTime.parse(value.trim());
     }
 }
-
