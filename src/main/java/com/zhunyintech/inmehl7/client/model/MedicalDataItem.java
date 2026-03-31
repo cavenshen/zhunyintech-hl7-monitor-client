@@ -2,17 +2,45 @@ package com.zhunyintech.inmehl7.client.model;
 
 import java.time.LocalDateTime;
 
-public class Hl7Observation {
+public class MedicalDataItem {
+    private long id;
+    private long headerId;
+    private String segmentType;
     private String itemCode;
     private String itemName;
     private String valueType;
-    private String value;
+    private String valueText;
     private Double numericValue;
     private String unit;
-    private String referenceRange;
+    private String refRange;
     private String abnormalFlag;
     private LocalDateTime observedAt;
     private int sortNo;
+    private String extJson;
+
+    public long getId() {
+        return id;
+    }
+
+    public void setId(long id) {
+        this.id = id;
+    }
+
+    public long getHeaderId() {
+        return headerId;
+    }
+
+    public void setHeaderId(long headerId) {
+        this.headerId = headerId;
+    }
+
+    public String getSegmentType() {
+        return segmentType;
+    }
+
+    public void setSegmentType(String segmentType) {
+        this.segmentType = segmentType;
+    }
 
     public String getItemCode() {
         return itemCode;
@@ -38,12 +66,12 @@ public class Hl7Observation {
         this.valueType = valueType;
     }
 
-    public String getValue() {
-        return value;
+    public String getValueText() {
+        return valueText;
     }
 
-    public void setValue(String value) {
-        this.value = value;
+    public void setValueText(String valueText) {
+        this.valueText = valueText;
     }
 
     public Double getNumericValue() {
@@ -62,12 +90,12 @@ public class Hl7Observation {
         this.unit = unit;
     }
 
-    public String getReferenceRange() {
-        return referenceRange;
+    public String getRefRange() {
+        return refRange;
     }
 
-    public void setReferenceRange(String referenceRange) {
-        this.referenceRange = referenceRange;
+    public void setRefRange(String refRange) {
+        this.refRange = refRange;
     }
 
     public String getAbnormalFlag() {
@@ -92,5 +120,13 @@ public class Hl7Observation {
 
     public void setSortNo(int sortNo) {
         this.sortNo = sortNo;
+    }
+
+    public String getExtJson() {
+        return extJson;
+    }
+
+    public void setExtJson(String extJson) {
+        this.extJson = extJson;
     }
 }

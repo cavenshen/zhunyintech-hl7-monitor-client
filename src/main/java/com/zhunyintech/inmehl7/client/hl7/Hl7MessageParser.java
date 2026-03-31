@@ -30,28 +30,42 @@ public class Hl7MessageParser {
         }
 
         String[] pid = findSegmentFields(segments, "PID");
+        String[] pv1 = findSegmentFields(segments, "PV1");
         String[] obr = findSegmentFields(segments, "OBR");
         List<String[]> obxList = findSegmentFieldList(segments, "OBX");
 
         Hl7ResultRecord record = new Hl7ResultRecord();
         record.setRecordId(UUID.randomUUID().toString());
+        record.setMessageType(componentPart(messageType, 0));
+        record.setTriggerEvent(componentPart(messageType, 1));
+        record.setHl7Version(field(msh, 11));
+        record.setSourceApplication(field(msh, 2));
+        record.setSourceFacility(field(msh, 3));
         record.setMessageControlId(controlId);
         record.setPatientId(cleanComposite(field(pid, 3)));
         record.setPatientName(cleanComposite(field(pid, 5)));
+        record.setPatientAge(firstNonBlank(cleanComposite(field(pid, 7)), cleanComposite(field(pid, 6))));
+        record.setPatientGender(firstNonBlank(field(pid, 8), field(pid, 7)));
         record.setSampleNo(cleanComposite(firstNonBlank(field(obr, 3), field(obr, 2))));
         record.setResultTime(parseHl7Time(field(obr, 7)));
+        record.setWardName(parseWardName(pv1));
+        record.setBedName(parseBedName(pv1));
         record.setRawMessage(message);
 
+        int sortNo = 1;
         for (String[] obx : obxList) {
             Hl7Observation observation = new Hl7Observation();
             String identifier = field(obx, 3);
             observation.setItemCode(cleanComposite(identifier));
-            observation.setItemName(compositePart(identifier, 1));
-            observation.setValue(field(obx, 5));
+            observation.setItemName(firstNonBlank(compositePart(identifier, 1), identifier));
+            observation.setValueType(field(obx, 2));
+            observation.setValue(firstNonBlank(field(obx, 5), field(obx, 4)));
+            observation.setNumericValue(parseNumericValue(observation.getValue()));
             observation.setUnit(field(obx, 6));
             observation.setReferenceRange(field(obx, 7));
             observation.setAbnormalFlag(field(obx, 8));
-            observation.setObservedAt(parseHl7Time(field(obx, 14)));
+            observation.setObservedAt(parseHl7Time(firstNonBlank(field(obx, 14), field(obr, 7))));
+            observation.setSortNo(sortNo++);
             record.getObservations().add(observation);
         }
 
@@ -151,6 +165,10 @@ public class Hl7MessageParser {
         return part == null || part.trim().isEmpty() ? null : part.trim();
     }
 
+    private String componentPart(String value, int index) {
+        return compositePart(value, index);
+    }
+
     private String firstNonBlank(String... values) {
         if (values == null) {
             return null;
@@ -181,6 +199,49 @@ public class Hl7MessageParser {
         } catch (Exception ignored) {
         }
         return LocalDateTime.now();
+    }
+
+    private Double parseNumericValue(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(value.trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String parseWardName(String[] pv1) {
+        String location = field(pv1, 3);
+        if (location == null) {
+            return null;
+        }
+        String[] parts = location.split("\\^", -1);
+        if (parts.length < 3) {
+            return null;
+        }
+        String[] sub = parts[2].split("&", -1);
+        if (sub.length < 2) {
+            return null;
+        }
+        return firstNonBlank(sub[1]);
+    }
+
+    private String parseBedName(String[] pv1) {
+        String location = field(pv1, 3);
+        if (location == null) {
+            return null;
+        }
+        String[] parts = location.split("\\^", -1);
+        if (parts.length < 3) {
+            return null;
+        }
+        String[] sub = parts[2].split("&", -1);
+        if (sub.length == 0) {
+            return null;
+        }
+        return firstNonBlank(sub[0]);
     }
 
     public static class ParseResult {

@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -46,8 +47,11 @@ public class MllpServer {
                     executorService.submit(() -> handleClient(socket));
                 }
             } catch (IOException ex) {
-                if (running.get()) {
+                boolean wasRunning = running.getAndSet(false);
+                if (wasRunning) {
                     logger.error("MLLP server crashed", ex);
+                } else {
+                    logger.warn("MLLP listener stopped: " + ex.getMessage());
                 }
             }
         });
@@ -90,7 +94,7 @@ public class MllpServer {
                     int next = input.read();
                     if (next == CR) {
                         String message = frameBuffer.toString(StandardCharsets.UTF_8);
-                        String ack = messageHandler.onMessage(message);
+                        String ack = messageHandler.onMessage(buildContext(client, message));
                         if (ack != null && !ack.trim().isEmpty()) {
                             output.write(VT);
                             output.write(ack.getBytes(StandardCharsets.UTF_8));
@@ -111,7 +115,57 @@ public class MllpServer {
     }
 
     public interface MessageHandler {
-        String onMessage(String hl7Message);
+        String onMessage(MessageContext context);
+    }
+
+    public static class MessageContext {
+        private final int listenPort;
+        private final String remoteAddress;
+        private final String remoteIp;
+        private final int remotePort;
+        private final String hl7Message;
+
+        public MessageContext(int listenPort, String remoteAddress, String remoteIp, int remotePort, String hl7Message) {
+            this.listenPort = listenPort;
+            this.remoteAddress = remoteAddress;
+            this.remoteIp = remoteIp;
+            this.remotePort = remotePort;
+            this.hl7Message = hl7Message;
+        }
+
+        public int getListenPort() {
+            return listenPort;
+        }
+
+        public String getRemoteAddress() {
+            return remoteAddress;
+        }
+
+        public String getRemoteIp() {
+            return remoteIp;
+        }
+
+        public int getRemotePort() {
+            return remotePort;
+        }
+
+        public String getHl7Message() {
+            return hl7Message;
+        }
+    }
+
+    private MessageContext buildContext(Socket client, String message) {
+        String remoteAddress = client.getRemoteSocketAddress() == null
+            ? null
+            : client.getRemoteSocketAddress().toString();
+        String remoteIp = null;
+        int remotePort = -1;
+        if (client.getRemoteSocketAddress() instanceof InetSocketAddress address) {
+            if (address.getAddress() != null) {
+                remoteIp = address.getAddress().getHostAddress();
+            }
+            remotePort = address.getPort();
+        }
+        return new MessageContext(port, remoteAddress, remoteIp, remotePort, message);
     }
 }
-
