@@ -24,6 +24,7 @@ import javafx.application.Platform;
 import javafx.beans.property.ReadOnlyStringWrapper;
 import javafx.collections.FXCollections;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.CheckBox;
@@ -133,14 +134,14 @@ public class InmeHl7ClientApplication extends Application {
     public void start(Stage stage) {
         this.primaryStage = stage;
         initRuntime();
-        stage.setTitle("inme-hl7 monitor client");
+        stage.setTitle("寅米医疗器械接入终端软件");
         if (appState.hasToken() || appState.hasCompletedLogin()) {
             appState.clearSession();
             appendLog("已清理本地登录状态，进入系统前请先完成浏览器 SSO 登录。");
         }
-        showLoginScene("请先完成浏览器 SSO 登录，再进入客户端。");
+        showLoginScene("请点击下方按钮完成浏览器登录。");
         stage.show();
-        appendLog("客户端已启动，等待浏览器 SSO 登录。");
+        appendLog("客户端已启动，等待浏览器登录。");
         /*
         VBox root = new VBox(10);
         root.setPadding(new Insets(12));
@@ -211,20 +212,22 @@ public class InmeHl7ClientApplication extends Application {
         if (loginScene == null) {
             loginScene = buildLoginScene();
         }
-        syncLoginConfigFields();
         if (loginStatusLabel != null) {
-            loginStatusLabel.setText(valueOrDefault(statusText, "请使用浏览器完成 SSO 登录。"));
+            loginStatusLabel.setText(valueOrDefault(statusText, "请点击下方按钮完成浏览器登录。"));
         }
         if (primaryStage != null) {
             primaryStage.setScene(loginScene);
-            primaryStage.setWidth(860);
-            primaryStage.setHeight(620);
-            primaryStage.setMinWidth(860);
-            primaryStage.setMinHeight(620);
+            primaryStage.setWidth(920);
+            primaryStage.setHeight(560);
+            primaryStage.setMinWidth(920);
+            primaryStage.setMinHeight(560);
         }
     }
 
     private Scene buildLoginScene() {
+        if (useSimpleLoginScene()) {
+            return buildBrandedLoginScene();
+        }
         VBox root = new VBox(12);
         root.setPadding(new Insets(20));
 
@@ -262,6 +265,78 @@ public class InmeHl7ClientApplication extends Application {
 
         root.getChildren().addAll(title, hint, grid, actionBox, loginStatusLabel, loginLogArea);
         return new Scene(root, 860, 620);
+    }
+
+    private boolean useSimpleLoginScene() {
+        return true;
+    }
+
+    private Scene buildSimpleLoginScene() {
+        VBox root = new VBox(16);
+        root.setPadding(new Insets(28));
+        root.setAlignment(Pos.CENTER);
+
+        loginStatusLabel = new Label("请先完成浏览器 SSO 登录，再进入客户端。");
+        loginStatusLabel.setWrapText(true);
+        loginStatusLabel.setMaxWidth(420);
+        loginStatusLabel.setAlignment(Pos.CENTER);
+        loginStatusLabel.setStyle("-fx-font-size: 14px;");
+
+        loginButton = new Button("浏览器 SSO 登录");
+        loginButton.setDefaultButton(true);
+        loginButton.setPrefWidth(160);
+        loginButton.setPrefHeight(36);
+        loginButton.setOnAction(e -> loginFromLoginScene());
+
+        root.getChildren().addAll(loginStatusLabel, loginButton);
+        return new Scene(root, 560, 240);
+    }
+
+    private Scene buildBrandedLoginScene() {
+        VBox root = new VBox();
+        root.setAlignment(Pos.CENTER);
+        root.setStyle("-fx-background-color: linear-gradient(to bottom right, #f5fbff, #e7f1fb 45%, #dce8f6 100%);");
+
+        VBox card = new VBox(22);
+        card.setAlignment(Pos.CENTER);
+        card.setMaxWidth(620);
+        card.setPadding(new Insets(42, 54, 42, 54));
+        card.setStyle("-fx-background-color: rgba(255,255,255,0.96);"
+            + "-fx-background-radius: 24;"
+            + "-fx-border-radius: 24;"
+            + "-fx-border-color: rgba(127,156,186,0.28);"
+            + "-fx-border-width: 1;"
+            + "-fx-effect: dropshadow(gaussian, rgba(35,74,120,0.16), 32, 0.18, 0, 12);");
+
+        Label title = new Label("寅米医疗器械接入终端软件");
+        title.setWrapText(true);
+        title.setAlignment(Pos.CENTER);
+        title.setStyle("-fx-font-size: 32px;"
+            + "-fx-font-weight: bold;"
+            + "-fx-text-fill: #16324f;");
+
+        loginStatusLabel = new Label("请点击下方按钮完成浏览器登录。");
+        loginStatusLabel.setWrapText(true);
+        loginStatusLabel.setMaxWidth(520);
+        loginStatusLabel.setAlignment(Pos.CENTER);
+        loginStatusLabel.setStyle("-fx-font-size: 16px;"
+            + "-fx-text-fill: #204161;");
+
+        loginButton = new Button("浏览器登录");
+        loginButton.setDefaultButton(true);
+        loginButton.setPrefWidth(240);
+        loginButton.setPrefHeight(46);
+        loginButton.setStyle("-fx-background-color: linear-gradient(to bottom, #7fd1ff, #49b6f2);"
+            + "-fx-background-radius: 12;"
+            + "-fx-text-fill: #17324d;"
+            + "-fx-font-size: 15px;"
+            + "-fx-font-weight: bold;"
+            + "-fx-cursor: hand;");
+        loginButton.setOnAction(e -> loginFromLoginScene());
+
+        card.getChildren().addAll(title, loginStatusLabel, loginButton);
+        root.getChildren().add(card);
+        return new Scene(root, 920, 560);
     }
 
     private void syncLoginConfigFields() {
@@ -325,23 +400,68 @@ public class InmeHl7ClientApplication extends Application {
         if (uiLoginInProgress.get()) {
             return;
         }
-        saveLoginConfig();
         setLoginUiBusy(true);
-        if (loginStatusLabel != null) {
-            loginStatusLabel.setText("正在打开浏览器，请在浏览器中完成 SSO 授权。");
-        }
+        setLoginStatusMessage("登录中,请稍后...");
         ioExecutor.submit(() -> {
-            boolean ok = appState.loginInBrowser(this::appendLog);
+            boolean ok = appState.loginInBrowser(this::handleLoginProgress);
             Platform.runLater(() -> {
                 setLoginUiBusy(false);
                 if (!ok || !appState.hasCompletedLogin()) {
-                    if (loginStatusLabel != null) {
-                        loginStatusLabel.setText("登录尚未完成，请在浏览器授权完成后重试。");
+                    if (loginStatusLabel != null
+                        && (loginStatusLabel.getText() == null
+                        || loginStatusLabel.getText().isBlank()
+                        || "登录中,请稍后...".equals(loginStatusLabel.getText()))) {
+                        loginStatusLabel.setText("登录失败，请稍后重试。");
                     }
                     return;
                 }
                 showMainSceneCn();
             });
+        });
+    }
+
+    private void handleLoginProgress(String line) {
+        appendLog(line);
+        String status = mapLoginStatusMessage(line);
+        if (status != null) {
+            setLoginStatusMessage(status);
+        }
+    }
+
+    private String mapLoginStatusMessage(String line) {
+        if (line == null || line.isBlank()) {
+            return null;
+        }
+        String text = line.trim();
+        if (text.contains("超时")) {
+            return "登录超时，请重新点击浏览器登录。";
+        }
+        if (text.contains("失败")) {
+            if (text.endsWith(": null") || text.endsWith("：null") || "失败".equals(text)) {
+                return "登录失败，请检查网络或稍后重试。";
+            }
+            return text;
+        }
+        if (text.contains("拒绝")) {
+            return "登录失败：" + text;
+        }
+        if (text.contains("未获取到 token") || text.contains("未获取到登录凭证")) {
+            return "登录失败：未获取到登录凭证。";
+        }
+        if (text.contains("初始化机构信息")) {
+            return "登录成功，正在初始化机构信息...";
+        }
+        return "登录中,请稍后...";
+    }
+
+    private void setLoginStatusMessage(String message) {
+        if (message == null || message.isBlank()) {
+            return;
+        }
+        Platform.runLater(() -> {
+            if (loginStatusLabel != null) {
+                loginStatusLabel.setText(message);
+            }
         });
     }
 
@@ -1331,9 +1451,6 @@ public class InmeHl7ClientApplication extends Application {
             return;
         }
         Platform.runLater(() -> {
-            if (loginStatusLabel != null) {
-                loginStatusLabel.setText(line);
-            }
             if (loginLogArea != null) {
                 loginLogArea.appendText(line + System.lineSeparator());
             }
