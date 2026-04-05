@@ -472,6 +472,9 @@ public class AppState {
             normalizeOrgCode(text(ssoProfile, "orgCode", "orgcode")),
             normalizeOrgCode(text(firstArrayObject(authOrgs), "orgCode", "orgcode"))
         );
+        if (isBlank(orgCode)) {
+            orgCode = normalizeConfiguredOrgCode(config.get("orgCode"));
+        }
         JsonNode orgNode = null;
         if (!isBlank(orgCode)) {
             String orgInfoPath = valueOrDefault(config.get("orgInfoPath"), "/api/zyhisplus/v1/phisstockinvi/getPaykindInfo/{orgCode}");
@@ -482,6 +485,9 @@ public class AppState {
         OrgInfo orgInfo = mergeOrgInfo(orgCode, ssoProfile, authMe, firstArrayObject(authOrgs), orgNode);
         if (orgInfo == null || isBlank(orgInfo.getOrgCode())) {
             throw new IOException("未解析到机构编码");
+        }
+        if (orgInfo == null || isBlank(orgInfo.getOrgCode())) {
+            throw new IOException("未解析到机构编码，请确认 SSO 机构信息或业务端授权接口配置");
         }
         repository.saveOrgInfo(orgInfo);
         currentOrgInfo = orgInfo;
@@ -711,6 +717,14 @@ public class AppState {
 
     private String resolvePhisBaseUrl() {
         return trimTrailingSlash(firstNonBlank(config.get("phisBaseUrl"), resolveAppBaseUrl()));
+    }
+
+    private String normalizeConfiguredOrgCode(String value) {
+        String normalized = normalizeOrgCode(value);
+        if (isBlank(normalized) || "DEFAULT".equalsIgnoreCase(normalized)) {
+            return null;
+        }
+        return normalized;
     }
 
     private void notify(Consumer<String> callback, String message) {

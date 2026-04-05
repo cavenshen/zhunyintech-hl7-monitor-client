@@ -433,6 +433,11 @@ public class InmeHl7ClientApplication extends Application {
             return null;
         }
         String text = line.trim();
+        if (text.contains("业务端个人信息获取失败")
+            || text.contains("业务端机构列表获取失败")
+            || text.contains("机构详情获取失败")) {
+            return "登录中,请稍后...";
+        }
         if (text.contains("超时")) {
             return "登录超时，请重新点击浏览器登录。";
         }
@@ -534,7 +539,6 @@ public class InmeHl7ClientApplication extends Application {
     private void showMainSceneCn() {
         VBox root = new VBox(10);
         root.setPadding(new Insets(12));
-        root.getChildren().add(buildStatusBox());
         root.getChildren().add(buildConfigBoxCn());
         root.getChildren().add(buildActionBoxCn());
 
@@ -569,10 +573,6 @@ public class InmeHl7ClientApplication extends Application {
         grid.setHgap(10);
         grid.setVgap(8);
         int row = 0;
-        ssoBaseUrlField = addField(grid, row++, "ssoBaseUrl", config.get("ssoBaseUrl"));
-        ssoAppIdField = addField(grid, row++, "ssoAppId", config.get("ssoAppId"));
-        appBaseUrlField = addField(grid, row++, "appBaseUrl", config.get("appBaseUrl"));
-        serverApiBaseField = addField(grid, row++, "serverClientApiBase", config.get("serverClientApiBase"));
         clientCodeField = addField(grid, row++, "clientCode", config.get("clientCode"));
         orgCodeField = addField(grid, row++, "orgCode", appState.getCurrentOrgCode());
         deviceIdField = addField(grid, row++, "deviceId(\u517c\u5bb9)", config.get("deviceId"));
@@ -743,10 +743,6 @@ public class InmeHl7ClientApplication extends Application {
         grid.setHgap(10);
         grid.setVgap(8);
         int row = 0;
-        ssoBaseUrlField = addField(grid, row++, "ssoBaseUrl", config.get("ssoBaseUrl"));
-        ssoAppIdField = addField(grid, row++, "ssoAppId", config.get("ssoAppId"));
-        appBaseUrlField = addField(grid, row++, "appBaseUrl", config.get("appBaseUrl"));
-        serverApiBaseField = addField(grid, row++, "serverClientApiBase", config.get("serverClientApiBase"));
         clientCodeField = addField(grid, row++, "clientCode", config.get("clientCode"));
         orgCodeField = addField(grid, row++, "orgCode", appState.getCurrentOrgCode());
         deviceIdField = addField(grid, row++, "deviceId(兼容)", config.get("deviceId"));
@@ -924,17 +920,17 @@ public class InmeHl7ClientApplication extends Application {
     }
 
     private void saveConfig() {
-        config.set("ssoBaseUrl", ssoBaseUrlField.getText());
-        config.set("ssoAppId", ssoAppIdField.getText());
-        config.set("appBaseUrl", appBaseUrlField.getText());
-        config.set("serverClientApiBase", serverApiBaseField.getText());
-        config.set("clientCode", clientCodeField.getText());
-        config.set("orgCode", orgCodeField.getText());
-        config.set("deviceId", deviceIdField.getText());
-        config.set("hl7ListenerPort", listenerPortField.getText());
-        config.set("syncIntervalSec", syncIntervalField.getText());
-        config.set("heartbeatIntervalSec", heartbeatIntervalField.getText());
-        config.set("exportDir", exportDirField.getText());
+        config.set("ssoBaseUrl", valueFromFieldOrConfig(ssoBaseUrlField, "ssoBaseUrl"));
+        config.set("ssoAppId", valueFromFieldOrConfig(ssoAppIdField, "ssoAppId"));
+        config.set("appBaseUrl", valueFromFieldOrConfig(appBaseUrlField, "appBaseUrl"));
+        config.set("serverClientApiBase", valueFromFieldOrConfig(serverApiBaseField, "serverClientApiBase"));
+        config.set("clientCode", valueFromFieldOrConfig(clientCodeField, "clientCode"));
+        config.set("orgCode", valueFromFieldOrConfig(orgCodeField, "orgCode"));
+        config.set("deviceId", valueFromFieldOrConfig(deviceIdField, "deviceId"));
+        config.set("hl7ListenerPort", valueFromFieldOrConfig(listenerPortField, "hl7ListenerPort"));
+        config.set("syncIntervalSec", valueFromFieldOrConfig(syncIntervalField, "syncIntervalSec"));
+        config.set("heartbeatIntervalSec", valueFromFieldOrConfig(heartbeatIntervalField, "heartbeatIntervalSec"));
+        config.set("exportDir", valueFromFieldOrConfig(exportDirField, "exportDir"));
         try {
             config.saveExternal();
             appendLog("配置已保存");
@@ -943,6 +939,13 @@ public class InmeHl7ClientApplication extends Application {
             appendLog("配置保存失败: " + ex.getMessage());
             store.saveRuntimeEvent("CONFIG", "ERROR", "ui", ex.getMessage(), null);
         }
+    }
+
+    private String valueFromFieldOrConfig(TextField field, String key) {
+        if (field == null) {
+            return valueOrDefault(config.get(key), "");
+        }
+        return field.getText();
     }
 
     private void loginSso() {
