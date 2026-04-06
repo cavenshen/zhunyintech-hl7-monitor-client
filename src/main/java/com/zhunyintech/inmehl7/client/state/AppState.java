@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -48,6 +49,7 @@ public class AppState {
     private volatile String token;
     private volatile LicenseSnapshot licenseSnapshot = new LicenseSnapshot();
     private volatile OrgInfo currentOrgInfo;
+    private volatile List<OrgInfo> authorizedOrgInfos = Collections.emptyList();
 
     public AppState(Config config, SQLiteStore store, ClientRepository repository, RuntimeLogger logger) {
         this.config = config;
@@ -64,6 +66,7 @@ public class AppState {
         this.currentOrgInfo = repository.loadOrgInfo();
         if (currentOrgInfo != null && !isBlank(currentOrgInfo.getOrgCode())) {
             config.set("orgCode", currentOrgInfo.getOrgCode());
+            this.authorizedOrgInfos = Collections.singletonList(copyOrgInfo(currentOrgInfo));
         }
     }
 
@@ -94,6 +97,10 @@ public class AppState {
         return currentOrgInfo;
     }
 
+    public List<OrgInfo> getAuthorizedOrgInfos() {
+        return authorizedOrgInfos == null ? Collections.emptyList() : Collections.unmodifiableList(authorizedOrgInfos);
+    }
+
     public String getCurrentOrgCode() {
         return firstNonBlank(
             currentOrgInfo == null ? null : currentOrgInfo.getOrgCode(),
@@ -110,6 +117,36 @@ public class AppState {
         return hasToken() && isValidOrgCode(currentOrgInfo == null ? null : currentOrgInfo.getOrgCode());
     }
 
+    public String getAppVersion() {
+        return firstNonBlank(
+            blankToNull(config.get("appVersion")),
+            blankToNull(config.get("clientVersion")),
+            blankToNull(config.get("version")),
+            "1.0.0"
+        );
+    }
+
+    public void selectAuthorizedOrg(String orgCode) {
+        String normalized = normalizeOrgCode(orgCode);
+        if (isBlank(normalized)) {
+            return;
+        }
+        OrgInfo matched = null;
+        for (OrgInfo item : getAuthorizedOrgInfos()) {
+            if (item != null && normalized.equalsIgnoreCase(normalizeOrgCode(item.getOrgCode()))) {
+                matched = copyOrgInfo(item);
+                break;
+            }
+        }
+        if (matched == null) {
+            matched = currentOrgInfo == null ? new OrgInfo() : copyOrgInfo(currentOrgInfo);
+            matched.setOrgCode(normalized);
+        }
+        currentOrgInfo = matched;
+        config.set("orgCode", normalized);
+        repository.saveOrgInfo(matched);
+    }
+
     public boolean isLoginInProgress() {
         return loginInProgress.get();
     }
@@ -117,6 +154,7 @@ public class AppState {
     public void clearSession() {
         setToken(null);
         currentOrgInfo = null;
+        authorizedOrgInfos = Collections.emptyList();
         repository.clearOrgInfo();
         config.set("orgCode", "DEFAULT");
     }
@@ -491,6 +529,7 @@ public class AppState {
         }
         repository.saveOrgInfo(orgInfo);
         currentOrgInfo = orgInfo;
+        authorizedOrgInfos = buildAuthorizedOrgInfos(authOrgs, orgInfo);
         config.set("orgCode", orgInfo.getOrgCode());
         notify(statusCallback, "机构初始化完成: " + orgInfo.getOrgCode() + " / " + firstNonBlank(orgInfo.getOrgName(), "-"));
     }
@@ -526,6 +565,55 @@ public class AppState {
         orgInfo.setTokenSnapshot(maskToken(token));
         orgInfo.setLastLoginAt(LocalDateTime.now());
         return orgInfo;
+    }
+
+    private List<OrgInfo> buildAuthorizedOrgInfos(JsonNode authOrgs, OrgInfo currentOrg) {
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        List<OrgInfo> items = new ArrayList<>();
+        if (authOrgs != null && authOrgs.isArray()) {
+            for (JsonNode item : authOrgs) {
+                appendAuthorizedOrg(items, seen,
+                    text(item, "orgCode", "orgcode"),
+                    text(item, "orgName", "orgname", "name"));
+            }
+        }
+        if (currentOrg != null) {
+            appendAuthorizedOrg(items, seen, currentOrg.getOrgCode(), currentOrg.getOrgName());
+        }
+        return items.isEmpty() ? Collections.emptyList() : items;
+    }
+
+    private void appendAuthorizedOrg(List<OrgInfo> items,
+                                     LinkedHashSet<String> seen,
+                                     String orgCode,
+                                     String orgName) {
+        String normalized = normalizeOrgCode(orgCode);
+        if (isBlank(normalized) || seen.contains(normalized)) {
+            return;
+        }
+        OrgInfo item = new OrgInfo();
+        item.setOrgCode(normalized);
+        item.setOrgName(firstNonBlank(orgName, normalized));
+        items.add(item);
+        seen.add(normalized);
+    }
+
+    private OrgInfo copyOrgInfo(OrgInfo source) {
+        if (source == null) {
+            return null;
+        }
+        OrgInfo target = new OrgInfo();
+        target.setOrgCode(source.getOrgCode());
+        target.setOrgName(source.getOrgName());
+        target.setHisCode(source.getHisCode());
+        target.setSiOrgCode(source.getSiOrgCode());
+        target.setWebserviceUrl(source.getWebserviceUrl());
+        target.setSsoAccount(source.getSsoAccount());
+        target.setOperId(source.getOperId());
+        target.setRealName(source.getRealName());
+        target.setTokenSnapshot(source.getTokenSnapshot());
+        target.setLastLoginAt(source.getLastLoginAt());
+        return target;
     }
 
     private JsonNode getJson(String url) throws IOException, InterruptedException {

@@ -1,6 +1,7 @@
 package com.zhunyintech.inmehl7.client;
 
-import java.awt.Desktop;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zhunyintech.inmehl7.client.config.Config;
 import com.zhunyintech.inmehl7.client.db.ClientRepository;
 import com.zhunyintech.inmehl7.client.db.SQLiteStore;
@@ -14,8 +15,13 @@ import com.zhunyintech.inmehl7.client.model.Hl7ResultRecord;
 import com.zhunyintech.inmehl7.client.model.LicenseSnapshot;
 import com.zhunyintech.inmehl7.client.model.MedicalDataItem;
 import com.zhunyintech.inmehl7.client.model.MedicalDataRecord;
+import com.zhunyintech.inmehl7.client.model.MonitorListenerProfile;
+import com.zhunyintech.inmehl7.client.model.MonitorProtocolType;
 import com.zhunyintech.inmehl7.client.model.OrgInfo;
+import com.zhunyintech.inmehl7.client.serial.SerialProtocolListener;
 import com.zhunyintech.inmehl7.client.state.AppState;
+import com.zhunyintech.inmehl7.client.support.ClientMachineSupport;
+import com.zhunyintech.inmehl7.client.sync.MonitorConfigApiClient;
 import com.zhunyintech.inmehl7.client.sync.ServerApiClient;
 import com.zhunyintech.inmehl7.client.sync.SyncScheduler;
 import com.zhunyintech.inmehl7.client.ventilator.VentilatorRecordSupport;
@@ -26,11 +32,17 @@ import javafx.collections.FXCollections;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
+import javafx.scene.Node;
 import javafx.scene.control.Button;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.Label;
 import javafx.scene.control.Alert;
+import javafx.scene.control.ButtonType;
+import javafx.scene.control.Menu;
+import javafx.scene.control.MenuBar;
+import javafx.scene.control.MenuItem;
+import javafx.scene.control.SeparatorMenuItem;
 import javafx.scene.control.SplitPane;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
@@ -43,15 +55,29 @@ import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
+import javafx.stage.DirectoryChooser;
 import javafx.util.StringConverter;
 
+import java.awt.Desktop;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URLConnection;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -63,6 +89,12 @@ public class InmeHl7ClientApplication extends Application {
     private final ExecutorService ioExecutor = Executors.newCachedThreadPool();
     private final Hl7MessageParser parser = new Hl7MessageParser();
     private final DataExportService exportService = new DataExportService();
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final HttpClient httpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(10))
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .version(HttpClient.Version.HTTP_1_1)
+        .build();
 
     private Config config;
     private RuntimeLogger logger;
@@ -70,12 +102,17 @@ public class InmeHl7ClientApplication extends Application {
     private ClientRepository repository;
     private AppState appState;
     private ServerApiClient apiClient;
+    private MonitorConfigApiClient monitorConfigApiClient;
     private SyncScheduler syncScheduler;
     private ListenerManager listenerManager;
+    private SerialProtocolListener serialProtocolListener;
     private Stage primaryStage;
     private Scene loginScene;
     private Scene mainScene;
     private final AtomicBoolean uiLoginInProgress = new AtomicBoolean(false);
+    private final Map<MonitorProtocolType, MonitorListenerProfile> listenerProfileCache = new EnumMap<>(MonitorProtocolType.class);
+    private String localMacAddress;
+    private String generatedClientCode;
 
     private TextField loginSsoBaseUrlField;
     private TextField loginSsoAppIdField;
@@ -99,11 +136,27 @@ public class InmeHl7ClientApplication extends Application {
     private TextField serverApiBaseField;
     private TextField clientCodeField;
     private TextField orgCodeField;
+    private ComboBox<OrgInfo> authorizedOrgCombo;
     private TextField deviceIdField;
     private TextField listenerPortField;
     private TextField syncIntervalField;
     private TextField heartbeatIntervalField;
     private TextField exportDirField;
+    private ComboBox<MonitorProtocolType> protocolTypeCombo;
+    private TextField serialPortNameField;
+    private ComboBox<String> baudRateCombo;
+    private ComboBox<String> dataBitsCombo;
+    private ComboBox<String> stopBitsCombo;
+    private ComboBox<String> parityCombo;
+    private TextField readTimeoutField;
+    private TextField pollIntervalField;
+    private ComboBox<String> charsetCombo;
+    private ComboBox<String> frameDelimiterCombo;
+    private TextField stationNoField;
+    private VBox protocolConfigBox;
+    private Label configStatusLabel;
+    private Button configSaveButton;
+    private Button exportDirChooseButton;
 
     private TableView<DeviceRegistry> deviceTable;
     private TextField deviceTypeField;
@@ -182,12 +235,15 @@ public class InmeHl7ClientApplication extends Application {
         if (syncScheduler != null) {
             syncScheduler.stop();
         }
-        stopListeners();
+        stopMonitorListeners();
         ioExecutor.shutdownNow();
     }
 
     private void initRuntime() {
         config = new Config();
+        localMacAddress = ClientMachineSupport.resolveLocalMacAddress();
+        generatedClientCode = ClientMachineSupport.buildClientCode(localMacAddress);
+        config.set("clientCode", generatedClientCode);
         logger = new RuntimeLogger(config);
         logger.bindSink(this::appendLog);
         store = new SQLiteStore(config, logger);
@@ -196,10 +252,11 @@ public class InmeHl7ClientApplication extends Application {
         repository.init();
         appState = new AppState(config, store, repository, logger);
         apiClient = new ServerApiClient(config, logger);
+        monitorConfigApiClient = new MonitorConfigApiClient(config, logger);
         listenerManager = new ListenerManager(logger, this::handleHl7Message);
         syncScheduler = new SyncScheduler(
             config, logger, store, appState, apiClient,
-            () -> listenerManager != null && listenerManager.isRunning(),
+            this::isAnyListenerRunning,
             this::appendLog
         );
     }
@@ -208,7 +265,7 @@ public class InmeHl7ClientApplication extends Application {
         if (syncScheduler != null) {
             syncScheduler.stop();
         }
-        stopListeners();
+        stopMonitorListeners();
         if (loginScene == null) {
             loginScene = buildLoginScene();
         }
@@ -539,8 +596,8 @@ public class InmeHl7ClientApplication extends Application {
     private void showMainSceneCn() {
         VBox root = new VBox(10);
         root.setPadding(new Insets(12));
-        root.getChildren().add(buildConfigBoxCn());
-        root.getChildren().add(buildActionBoxCn());
+        root.getChildren().add(buildMainMenuBarCn());
+        root.getChildren().add(buildMonitorConfigPaneCn());
 
         TabPane tabPane = new TabPane();
         tabPane.getTabs().add(new Tab("\u8bbe\u5907\u53f0\u8d26", buildDeviceTabCn()));
@@ -560,12 +617,431 @@ public class InmeHl7ClientApplication extends Application {
         }
 
         refreshStatusLabels();
+        refreshMonitorConfigUi();
+        loadRemoteProfilesAsyncV2();
         refreshDevicesAsync();
         queryRecordsAsync();
         syncScheduler.start();
-        if (orgCodeField != null) {
-            orgCodeField.setText(appState.getCurrentOrgCode());
+    }
+
+    private MenuBar buildMainMenuBarCn() {
+        Menu systemMenu = new Menu("系统");
+        MenuItem saveConfigItem = new MenuItem("保存监听配置");
+        saveConfigItem.setOnAction(e -> saveMonitorConfig());
+        MenuItem reloginItem = new MenuItem("重新登录");
+        reloginItem.setOnAction(e -> loginSso());
+        MenuItem logoutItem = new MenuItem("退出登录");
+        logoutItem.setOnAction(e -> logoutToLoginScene());
+        systemMenu.getItems().addAll(saveConfigItem, new SeparatorMenuItem(), reloginItem, logoutItem);
+
+        Menu listenerMenu = new Menu("设备监听");
+        MenuItem startItem = new MenuItem("启动监听");
+        startItem.setOnAction(e -> startMonitorListeners());
+        MenuItem stopItem = new MenuItem("停止监听");
+        stopItem.setOnAction(e -> stopMonitorListeners());
+        MenuItem syncItem = new MenuItem("立即同步");
+        syncItem.setOnAction(e -> {
+            if (syncScheduler != null) {
+                syncScheduler.triggerSyncNow();
+            }
+        });
+        listenerMenu.getItems().addAll(startItem, stopItem, new SeparatorMenuItem(), syncItem);
+
+        Menu aboutMenu = new Menu("关于");
+        MenuItem versionItem = new MenuItem("当前版本");
+        versionItem.setOnAction(e -> showAboutDialog());
+        MenuItem upgradeItem = new MenuItem("版本升级");
+        upgradeItem.setOnAction(e -> checkForUpdateAsync());
+        aboutMenu.getItems().addAll(versionItem, upgradeItem);
+
+        return new MenuBar(systemMenu, listenerMenu, aboutMenu);
+    }
+
+    private VBox buildMonitorConfigPaneCn() {
+        VBox box = new VBox(10);
+        box.setPadding(new Insets(14));
+        box.setStyle("-fx-background-color: #ffffff; -fx-background-radius: 10; -fx-border-color: #d8e2ee; -fx-border-radius: 10;");
+
+        Label title = new Label("监听参数配置");
+        title.setStyle("-fx-font-size: 18px; -fx-font-weight: bold; -fx-text-fill: #16324f;");
+
+        clientCodeField = new TextField(generatedClientCode);
+        clientCodeField.setEditable(false);
+        clientCodeField.setDisable(true);
+
+        orgCodeField = new TextField(appState.getCurrentOrgCode());
+        orgCodeField.setManaged(false);
+        orgCodeField.setVisible(false);
+
+        authorizedOrgCombo = new ComboBox<>();
+        authorizedOrgCombo.setConverter(new StringConverter<>() {
+            @Override
+            public String toString(OrgInfo object) {
+                if (object == null) {
+                    return "";
+                }
+                return joinText(object.getOrgName(), object.getOrgCode(), " / ");
+            }
+
+            @Override
+            public OrgInfo fromString(String string) {
+                return null;
+            }
+        });
+        authorizedOrgCombo.valueProperty().addListener((obs, old, value) -> {
+            if (value == null) {
+                return;
+            }
+            orgCodeField.setText(valueOrDefault(value.getOrgCode(), ""));
+            appState.selectAuthorizedOrg(value.getOrgCode());
+            MonitorListenerProfile profile = collectProfileFromForm();
+            if (profile != null) {
+                profile.setOrgCode(value.getOrgCode());
+                profile.setOrgName(value.getOrgName());
+                listenerProfileCache.put(profile.getProtocolType(), profile);
+            }
+            refreshDevicesAsync();
+            queryRecordsAsync();
+        });
+
+        protocolTypeCombo = new ComboBox<>(FXCollections.observableArrayList(MonitorProtocolType.values()));
+        protocolTypeCombo.valueProperty().addListener((obs, old, value) -> {
+            if (value == null) {
+                return;
+            }
+            if (old != null) {
+                MonitorListenerProfile oldProfile = collectProfileFromForm();
+                if (oldProfile != null) {
+                    listenerProfileCache.put(old, oldProfile);
+                }
+            }
+            applyProfileToForm(getOrCreateProfile(value));
+            updateConfigEditStateV2();
+        });
+
+        syncIntervalField = new TextField();
+        heartbeatIntervalField = new TextField();
+        exportDirField = new TextField();
+        exportDirChooseButton = new Button("选择目录");
+        exportDirChooseButton.setOnAction(e -> chooseExportDirectoryV2());
+
+        HBox exportDirBox = new HBox(8, exportDirField, exportDirChooseButton);
+        HBox.setHgrow(exportDirField, Priority.ALWAYS);
+
+        GridPane grid = new GridPane();
+        grid.setHgap(14);
+        grid.setVgap(10);
+        addConfigItem(grid, 0, 0, "客户端编号", clientCodeField);
+        addConfigItem(grid, 0, 1, "授权机构", authorizedOrgCombo);
+        addConfigItem(grid, 1, 0, "监听协议", protocolTypeCombo);
+        addConfigItem(grid, 1, 1, "数据导出目录", exportDirBox);
+        addConfigItem(grid, 2, 0, "数据采集时间(秒)", syncIntervalField);
+        addConfigItem(grid, 2, 1, "心跳时间(秒)", heartbeatIntervalField);
+
+        protocolConfigBox = new VBox(8);
+
+        configSaveButton = new Button("保存监听配置");
+        configSaveButton.setOnAction(e -> saveMonitorConfig());
+        configStatusLabel = new Label("监听配置使用应用默认值，可按协议覆盖保存。");
+        configStatusLabel.setStyle("-fx-text-fill: #47617d;");
+
+        HBox footer = new HBox(12, configSaveButton, configStatusLabel);
+        footer.setAlignment(Pos.CENTER_LEFT);
+
+        box.getChildren().addAll(title, grid, protocolConfigBox, footer, orgCodeField);
+        return box;
+    }
+
+    private void addConfigItem(GridPane grid, int row, int block, String labelText, Node control) {
+        int labelCol = block * 2;
+        int controlCol = labelCol + 1;
+        Label label = new Label(labelText);
+        label.setStyle("-fx-text-fill: #35506b;");
+        grid.add(label, labelCol, row);
+        grid.add(control, controlCol, row);
+        GridPane.setHgrow(control, Priority.ALWAYS);
+    }
+
+    private void refreshMonitorConfigUi() {
+        populateAuthorizedOrgOptions();
+        clientCodeField.setText(generatedClientCode);
+        MonitorProtocolType protocol = protocolTypeCombo.getValue() == null ? MonitorProtocolType.HL7 : protocolTypeCombo.getValue();
+        if (protocolTypeCombo.getItems().isEmpty()) {
+            protocolTypeCombo.setItems(FXCollections.observableArrayList(MonitorProtocolType.values()));
         }
+        protocolTypeCombo.setValue(protocol);
+        applyProfileToForm(getOrCreateProfile(protocol));
+        updateConfigEditStateV2();
+    }
+
+    private void populateAuthorizedOrgOptions() {
+        if (authorizedOrgCombo == null) {
+            return;
+        }
+        List<OrgInfo> options = new ArrayList<>(appState.getAuthorizedOrgInfos());
+        if (options.isEmpty() && appState.getCurrentOrgInfo() != null) {
+            options.add(appState.getCurrentOrgInfo());
+        }
+        authorizedOrgCombo.setItems(FXCollections.observableArrayList(options));
+        String currentOrgCode = appState.getCurrentOrgCode();
+        for (OrgInfo item : options) {
+            if (item != null && valueOrDefault(item.getOrgCode(), "").equalsIgnoreCase(valueOrDefault(currentOrgCode, ""))) {
+                authorizedOrgCombo.setValue(item);
+                orgCodeField.setText(valueOrDefault(item.getOrgCode(), ""));
+                return;
+            }
+        }
+        if (!options.isEmpty()) {
+            authorizedOrgCombo.setValue(options.get(0));
+            orgCodeField.setText(valueOrDefault(options.get(0).getOrgCode(), ""));
+        }
+    }
+
+    private MonitorListenerProfile getOrCreateProfile(MonitorProtocolType protocolType) {
+        MonitorProtocolType protocol = protocolType == null ? MonitorProtocolType.HL7 : protocolType;
+        MonitorListenerProfile cached = listenerProfileCache.get(protocol);
+        if (cached != null) {
+            return cached;
+        }
+        MonitorListenerProfile created = buildDefaultProfile(protocol);
+        listenerProfileCache.put(protocol, created);
+        return created;
+    }
+
+    private MonitorListenerProfile buildDefaultProfile(MonitorProtocolType protocolType) {
+        MonitorListenerProfile profile = new MonitorListenerProfile();
+        profile.setClientCode(generatedClientCode);
+        profile.setMacAddress(localMacAddress);
+        profile.setProtocolType(protocolType);
+        profile.setOrgCode(appState.getCurrentOrgCode());
+        profile.setOrgName(appState.getCurrentOrgInfo() == null ? null : appState.getCurrentOrgInfo().getOrgName());
+        profile.setExportDir(valueOrDefault(config.get("exportDir"), "./exports"));
+        profile.setSyncIntervalSec(parseInt(config.get("syncIntervalSec"), 60));
+        profile.setHeartbeatIntervalSec(parseInt(config.get("heartbeatIntervalSec"), 60));
+        profile.setListenPort(parseInt(config.get("hl7ListenerPort"), 5555));
+        profile.setSerialPortName(valueOrDefault(config.get("serialPortName"), "COM1"));
+        profile.setBaudRate(parseInt(config.get("serialBaudRate"), 9600));
+        profile.setDataBits(parseInt(config.get("serialDataBits"), 8));
+        profile.setStopBits(parseInt(config.get("serialStopBits"), 1));
+        profile.setParity(valueOrDefault(config.get("serialParity"), "NONE"));
+        profile.setReadTimeoutMs(parseInt(config.get("serialReadTimeoutMs"), 1000));
+        profile.setPollIntervalMs(parseInt(config.get("serialPollIntervalMs"), 500));
+        profile.setCharsetName(valueOrDefault(config.get("serialCharset"), "UTF-8"));
+        profile.setFrameDelimiter(valueOrDefault(config.get("serialFrameDelimiter"), "CRLF"));
+        profile.setStationNo(valueOrDefault(config.get("rs485StationNo"), "1"));
+        return profile;
+    }
+
+    private void applyProfileToForm(MonitorListenerProfile profile) {
+        if (profile == null) {
+            return;
+        }
+        clientCodeField.setText(valueOrDefault(profile.getClientCode(), generatedClientCode));
+        syncIntervalField.setText(String.valueOf(profile.getSyncIntervalSec()));
+        heartbeatIntervalField.setText(String.valueOf(profile.getHeartbeatIntervalSec()));
+        exportDirField.setText(valueOrDefault(profile.getExportDir(), ""));
+        selectOrg(profile.getOrgCode());
+        if (protocolTypeCombo.getValue() != profile.getProtocolType()) {
+            protocolTypeCombo.setValue(profile.getProtocolType());
+        }
+        rebuildProtocolConfigFields(profile);
+    }
+
+    private void selectOrg(String orgCode) {
+        if (authorizedOrgCombo == null || orgCode == null) {
+            return;
+        }
+        for (OrgInfo item : authorizedOrgCombo.getItems()) {
+            if (item != null && orgCode.equalsIgnoreCase(valueOrDefault(item.getOrgCode(), ""))) {
+                authorizedOrgCombo.setValue(item);
+                orgCodeField.setText(valueOrDefault(item.getOrgCode(), ""));
+                return;
+            }
+        }
+    }
+
+    private void rebuildProtocolConfigFields(MonitorListenerProfile profile) {
+        protocolConfigBox.getChildren().clear();
+        GridPane grid = new GridPane();
+        grid.setHgap(14);
+        grid.setVgap(10);
+
+        MonitorProtocolType protocolType = profile.getProtocolType();
+        if (protocolType == MonitorProtocolType.HL7) {
+            listenerPortField = new TextField(String.valueOf(profile.getListenPort() == null ? 5555 : profile.getListenPort()));
+            readTimeoutField = new TextField(String.valueOf(profile.getReadTimeoutMs() == null ? 1000 : profile.getReadTimeoutMs()));
+            charsetCombo = new ComboBox<>(FXCollections.observableArrayList("UTF-8", "GBK", "GB2312"));
+            charsetCombo.setValue(valueOrDefault(profile.getCharsetName(), "UTF-8"));
+            addConfigItem(grid, 0, 0, "监听端口", listenerPortField);
+            addConfigItem(grid, 0, 1, "读取超时(ms)", readTimeoutField);
+            addConfigItem(grid, 1, 0, "报文字符集", charsetCombo);
+        } else {
+            serialPortNameField = new TextField(valueOrDefault(profile.getSerialPortName(), "COM1"));
+            baudRateCombo = new ComboBox<>(FXCollections.observableArrayList("1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"));
+            baudRateCombo.setValue(String.valueOf(profile.getBaudRate() == null ? 9600 : profile.getBaudRate()));
+            dataBitsCombo = new ComboBox<>(FXCollections.observableArrayList("5", "6", "7", "8"));
+            dataBitsCombo.setValue(String.valueOf(profile.getDataBits() == null ? 8 : profile.getDataBits()));
+            stopBitsCombo = new ComboBox<>(FXCollections.observableArrayList("1", "2"));
+            stopBitsCombo.setValue(String.valueOf(profile.getStopBits() == null ? 1 : profile.getStopBits()));
+            parityCombo = new ComboBox<>(FXCollections.observableArrayList("NONE", "ODD", "EVEN"));
+            parityCombo.setValue(valueOrDefault(profile.getParity(), "NONE"));
+            readTimeoutField = new TextField(String.valueOf(profile.getReadTimeoutMs() == null ? 1000 : profile.getReadTimeoutMs()));
+            frameDelimiterCombo = new ComboBox<>(FXCollections.observableArrayList("CRLF", "CR", "LF"));
+            frameDelimiterCombo.setValue(valueOrDefault(profile.getFrameDelimiter(), "CRLF"));
+            charsetCombo = new ComboBox<>(FXCollections.observableArrayList("UTF-8", "GBK", "GB2312"));
+            charsetCombo.setValue(valueOrDefault(profile.getCharsetName(), "UTF-8"));
+            addConfigItem(grid, 0, 0, "串口号", serialPortNameField);
+            addConfigItem(grid, 0, 1, "波特率", baudRateCombo);
+            addConfigItem(grid, 1, 0, "数据位", dataBitsCombo);
+            addConfigItem(grid, 1, 1, "停止位", stopBitsCombo);
+            addConfigItem(grid, 2, 0, "校验位", parityCombo);
+            addConfigItem(grid, 2, 1, "读取超时(ms)", readTimeoutField);
+            addConfigItem(grid, 3, 0, "帧结束符", frameDelimiterCombo);
+            addConfigItem(grid, 3, 1, "字符集", charsetCombo);
+            if (protocolType == MonitorProtocolType.RS485) {
+                stationNoField = new TextField(valueOrDefault(profile.getStationNo(), "1"));
+                pollIntervalField = new TextField(String.valueOf(profile.getPollIntervalMs() == null ? 500 : profile.getPollIntervalMs()));
+                addConfigItem(grid, 4, 0, "站号", stationNoField);
+                addConfigItem(grid, 4, 1, "轮询间隔(ms)", pollIntervalField);
+            }
+        }
+        protocolConfigBox.getChildren().add(grid);
+    }
+
+    private MonitorListenerProfile collectProfileFromForm() {
+        if (protocolTypeCombo == null || protocolTypeCombo.getValue() == null) {
+            return null;
+        }
+        MonitorListenerProfile profile = getOrCreateProfile(protocolTypeCombo.getValue());
+        profile.setClientCode(generatedClientCode);
+        profile.setMacAddress(localMacAddress);
+        profile.setProtocolType(protocolTypeCombo.getValue());
+        OrgInfo selectedOrg = authorizedOrgCombo == null ? null : authorizedOrgCombo.getValue();
+        profile.setOrgCode(selectedOrg == null ? appState.getCurrentOrgCode() : selectedOrg.getOrgCode());
+        profile.setOrgName(selectedOrg == null ? null : selectedOrg.getOrgName());
+        profile.setExportDir(valueOrDefault(exportDirField == null ? null : exportDirField.getText(), ""));
+        profile.setSyncIntervalSec(parseInt(syncIntervalField == null ? null : syncIntervalField.getText(), 60));
+        profile.setHeartbeatIntervalSec(parseInt(heartbeatIntervalField == null ? null : heartbeatIntervalField.getText(), 60));
+        if (profile.getProtocolType() == MonitorProtocolType.HL7) {
+            profile.setListenPort(parseInt(listenerPortField == null ? null : listenerPortField.getText(), 5555));
+            profile.setReadTimeoutMs(parseInt(readTimeoutField == null ? null : readTimeoutField.getText(), 1000));
+            profile.setCharsetName(charsetCombo == null ? "UTF-8" : valueOrDefault(charsetCombo.getValue(), "UTF-8"));
+        } else {
+            profile.setSerialPortName(valueOrDefault(serialPortNameField == null ? null : serialPortNameField.getText(), "COM1"));
+            profile.setBaudRate(parseInt(baudRateCombo == null ? null : baudRateCombo.getValue(), 9600));
+            profile.setDataBits(parseInt(dataBitsCombo == null ? null : dataBitsCombo.getValue(), 8));
+            profile.setStopBits(parseInt(stopBitsCombo == null ? null : stopBitsCombo.getValue(), 1));
+            profile.setParity(valueOrDefault(parityCombo == null ? null : parityCombo.getValue(), "NONE"));
+            profile.setReadTimeoutMs(parseInt(readTimeoutField == null ? null : readTimeoutField.getText(), 1000));
+            profile.setFrameDelimiter(valueOrDefault(frameDelimiterCombo == null ? null : frameDelimiterCombo.getValue(), "CRLF"));
+            profile.setCharsetName(valueOrDefault(charsetCombo == null ? null : charsetCombo.getValue(), "UTF-8"));
+            profile.setPollIntervalMs(parseInt(pollIntervalField == null ? null : pollIntervalField.getText(), 500));
+            profile.setStationNo(valueOrDefault(stationNoField == null ? null : stationNoField.getText(), "1"));
+        }
+        return profile;
+    }
+
+    private void updateConfigEditState() {
+        boolean locked = isAnyListenerRunning();
+        if (authorizedOrgCombo != null) {
+            authorizedOrgCombo.setDisable(locked);
+        }
+        if (protocolTypeCombo != null) {
+            protocolTypeCombo.setDisable(locked);
+        }
+        if (syncIntervalField != null) {
+            syncIntervalField.setDisable(locked);
+        }
+        if (heartbeatIntervalField != null) {
+            heartbeatIntervalField.setDisable(locked);
+        }
+        if (exportDirField != null) {
+            exportDirField.setDisable(locked);
+        }
+        if (exportDirChooseButton != null) {
+            exportDirChooseButton.setDisable(locked);
+        }
+        if (configSaveButton != null) {
+            configSaveButton.setDisable(locked);
+        }
+        if (listenerPortField != null) {
+            listenerPortField.setDisable(locked);
+        }
+        if (serialPortNameField != null) {
+            serialPortNameField.setDisable(locked);
+        }
+        if (baudRateCombo != null) {
+            baudRateCombo.setDisable(locked);
+        }
+        if (dataBitsCombo != null) {
+            dataBitsCombo.setDisable(locked);
+        }
+        if (stopBitsCombo != null) {
+            stopBitsCombo.setDisable(locked);
+        }
+        if (parityCombo != null) {
+            parityCombo.setDisable(locked);
+        }
+        if (readTimeoutField != null) {
+            readTimeoutField.setDisable(locked);
+        }
+        if (pollIntervalField != null) {
+            pollIntervalField.setDisable(locked);
+        }
+        if (charsetCombo != null) {
+            charsetCombo.setDisable(locked);
+        }
+        if (frameDelimiterCombo != null) {
+            frameDelimiterCombo.setDisable(locked);
+        }
+        if (stationNoField != null) {
+            stationNoField.setDisable(locked);
+        }
+        if (configStatusLabel != null) {
+            configStatusLabel.setText(locked ? "监听已启动，当前机构和协议参数已锁定。" : "监听未启动，可修改并保存当前协议配置。");
+        }
+    }
+
+    private void chooseExportDirectory() {
+        DirectoryChooser chooser = new DirectoryChooser();
+        if (exportDirField != null && exportDirField.getText() != null && !exportDirField.getText().isBlank()) {
+            Path path = Paths.get(exportDirField.getText());
+            if (path.toFile().exists()) {
+                chooser.setInitialDirectory(path.toFile());
+            }
+        }
+        chooser.setTitle("选择数据导出目录");
+        java.io.File selected = chooser.showDialog(primaryStage);
+        if (selected != null && exportDirField != null) {
+            exportDirField.setText(selected.getAbsolutePath());
+        }
+    }
+
+    private void loadRemoteProfilesAsync() {
+        ioExecutor.submit(() -> {
+            try {
+                List<MonitorListenerProfile> items = monitorConfigApiClient.listProfiles(appState.getToken(), localMacAddress);
+                Platform.runLater(() -> {
+                    for (MonitorListenerProfile item : items) {
+                        if (item != null) {
+                            listenerProfileCache.put(item.getProtocolType(), item);
+                        }
+                    }
+                    applyProfileToForm(getOrCreateProfile(protocolTypeCombo == null ? MonitorProtocolType.HL7 : protocolTypeCombo.getValue()));
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText(items.isEmpty() ? "未读取到服务端监听配置，当前使用默认配置。" : "已读取服务端监听配置。");
+                    }
+                    updateConfigEditState();
+                });
+            } catch (Exception ex) {
+                appendLog("读取服务端监听配置失败: " + ex.getMessage());
+                Platform.runLater(() -> {
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("读取服务端监听配置失败，当前使用本地默认配置。");
+                    }
+                });
+            }
+        });
     }
 
     private GridPane buildConfigBoxCn() {
@@ -723,7 +1199,7 @@ public class InmeHl7ClientApplication extends Application {
         if (syncScheduler != null) {
             syncScheduler.stop();
         }
-        stopListeners();
+        stopMonitorListeners();
         appState.clearSession();
         mainScene = null;
         showLoginScene("已退出登录，请重新登录。");
@@ -919,6 +1395,597 @@ public class InmeHl7ClientApplication extends Application {
         return col;
     }
 
+    private void saveMonitorConfig() {
+        MonitorListenerProfile profile = collectProfileFromForm();
+        if (profile == null) {
+            showAlert(Alert.AlertType.ERROR, "保存失败", "请先选择监听协议。");
+            return;
+        }
+        listenerProfileCache.put(profile.getProtocolType(), cloneProfile(profile));
+        persistProfileToLocalConfig(profile);
+        try {
+            config.saveExternal();
+        } catch (Exception ex) {
+            appendLog("本地监听配置保存失败: " + ex.getMessage());
+            showAlert(Alert.AlertType.ERROR, "保存失败", ex.getMessage());
+            return;
+        }
+        if (configStatusLabel != null) {
+            configStatusLabel.setText("正在保存监听配置...");
+        }
+        ioExecutor.submit(() -> {
+            try {
+                MonitorListenerProfile saved = monitorConfigApiClient.saveProfile(appState.getToken(), profile);
+                MonitorListenerProfile finalProfile = saved == null ? profile : saved;
+                listenerProfileCache.put(finalProfile.getProtocolType(), cloneProfile(finalProfile));
+                appendLog("监听配置已保存到服务端: protocol=" + finalProfile.getProtocolType().getCode()
+                    + ", mac=" + valueOrDefault(finalProfile.getMacAddress(), "-"));
+                store.saveRuntimeEvent("CONFIG", "INFO", "ui", "Monitor config saved", null);
+                Platform.runLater(() -> {
+                    applyProfileToForm(finalProfile);
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("监听配置已保存。");
+                    }
+                    updateConfigEditStateV2();
+                });
+            } catch (Exception ex) {
+                appendLog("服务端监听配置保存失败: " + ex.getMessage());
+                store.saveRuntimeEvent("CONFIG", "ERROR", "ui", ex.getMessage(), null);
+                Platform.runLater(() -> {
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("服务端监听配置保存失败。");
+                    }
+                    showAlert(Alert.AlertType.ERROR, "保存失败", valueOrDefault(ex.getMessage(), "服务端监听配置保存失败"));
+                });
+            }
+        });
+    }
+
+    private void startMonitorListeners() {
+        ioExecutor.submit(() -> {
+            MonitorListenerProfile profile = collectProfileFromForm();
+            if (profile == null) {
+                Platform.runLater(() -> showAlert(Alert.AlertType.ERROR, "启动失败", "请先配置监听协议。"));
+                return;
+            }
+            listenerProfileCache.put(profile.getProtocolType(), cloneProfile(profile));
+            persistProfileToLocalConfig(profile);
+            try {
+                config.saveExternal();
+            } catch (Exception ignored) {
+            }
+
+            if (profile.getProtocolType() == MonitorProtocolType.HL7) {
+                stopSerialListenerQuietly();
+                LinkedHashSet<Integer> ports = new LinkedHashSet<>(repository.listActiveListenPorts(
+                    appState.getCurrentOrgCode(),
+                    profile.getListenPort() == null ? 5555 : profile.getListenPort()
+                ));
+                if (profile.getListenPort() != null && profile.getListenPort() > 0) {
+                    ports.add(profile.getListenPort());
+                }
+                listenerManager.start(new ArrayList<>(ports));
+                store.saveRuntimeEvent("MLLP", "INFO", "listener", "Listeners started " + ports, null);
+                appendLog("HL7 监听已启动: " + ports);
+            } else {
+                if (listenerManager != null) {
+                    listenerManager.stop();
+                }
+                stopSerialListenerQuietly();
+                serialProtocolListener = new SerialProtocolListener(profile, logger, this::handleSerialProtocolMessage);
+                serialProtocolListener.start();
+                store.saveRuntimeEvent(profile.getProtocolType().getCode(), "INFO", "listener",
+                    "Serial listener started " + valueOrDefault(profile.getSerialPortName(), "-"), null);
+                appendLog(profile.getProtocolType().getDisplayName() + "监听已启动: "
+                    + valueOrDefault(profile.getSerialPortName(), "-"));
+            }
+            Platform.runLater(() -> {
+                if (configStatusLabel != null) {
+                    configStatusLabel.setText(profile.getProtocolType().getDisplayName() + "监听已启动。");
+                }
+                refreshStatusLabels();
+                updateConfigEditStateV2();
+            });
+        });
+    }
+
+    private void stopMonitorListeners() {
+        if (listenerManager != null) {
+            listenerManager.stop();
+            store.saveRuntimeEvent("MLLP", "INFO", "listener", "Listeners stopped", null);
+        }
+        stopSerialListenerQuietly();
+        Platform.runLater(() -> {
+            if (configStatusLabel != null) {
+                configStatusLabel.setText("监听已停止，可以调整当前配置。");
+            }
+            refreshStatusLabels();
+            updateConfigEditStateV2();
+        });
+    }
+
+    private boolean isAnyListenerRunning() {
+        return (listenerManager != null && listenerManager.isRunning())
+            || (serialProtocolListener != null && serialProtocolListener.isRunning());
+    }
+
+    private void stopSerialListenerQuietly() {
+        if (serialProtocolListener == null) {
+            return;
+        }
+        try {
+            serialProtocolListener.stop();
+        } catch (Exception ignored) {
+        } finally {
+            serialProtocolListener = null;
+        }
+    }
+
+    private void updateConfigEditStateV2() {
+        boolean locked = isAnyListenerRunning();
+        if (authorizedOrgCombo != null) {
+            authorizedOrgCombo.setDisable(locked);
+        }
+        if (protocolTypeCombo != null) {
+            protocolTypeCombo.setDisable(locked);
+        }
+        if (syncIntervalField != null) {
+            syncIntervalField.setDisable(locked);
+        }
+        if (heartbeatIntervalField != null) {
+            heartbeatIntervalField.setDisable(locked);
+        }
+        if (exportDirField != null) {
+            exportDirField.setDisable(locked);
+        }
+        if (exportDirChooseButton != null) {
+            exportDirChooseButton.setDisable(locked);
+        }
+        if (configSaveButton != null) {
+            configSaveButton.setDisable(locked);
+        }
+        if (listenerPortField != null) {
+            listenerPortField.setDisable(locked);
+        }
+        if (serialPortNameField != null) {
+            serialPortNameField.setDisable(locked);
+        }
+        if (baudRateCombo != null) {
+            baudRateCombo.setDisable(locked);
+        }
+        if (dataBitsCombo != null) {
+            dataBitsCombo.setDisable(locked);
+        }
+        if (stopBitsCombo != null) {
+            stopBitsCombo.setDisable(locked);
+        }
+        if (parityCombo != null) {
+            parityCombo.setDisable(locked);
+        }
+        if (readTimeoutField != null) {
+            readTimeoutField.setDisable(locked);
+        }
+        if (pollIntervalField != null) {
+            pollIntervalField.setDisable(locked);
+        }
+        if (charsetCombo != null) {
+            charsetCombo.setDisable(locked);
+        }
+        if (frameDelimiterCombo != null) {
+            frameDelimiterCombo.setDisable(locked);
+        }
+        if (stationNoField != null) {
+            stationNoField.setDisable(locked);
+        }
+        if (configStatusLabel != null && configStatusLabel.getText() != null && configStatusLabel.getText().isBlank()) {
+            configStatusLabel.setText(locked ? "监听已启动，当前参数已锁定。" : "请先保存当前监听配置。");
+        }
+    }
+
+    private void chooseExportDirectoryV2() {
+        DirectoryChooser chooser = new DirectoryChooser();
+        if (exportDirField != null && exportDirField.getText() != null && !exportDirField.getText().isBlank()) {
+            Path path = Paths.get(exportDirField.getText());
+            if (Files.exists(path) && Files.isDirectory(path)) {
+                chooser.setInitialDirectory(path.toFile());
+            }
+        }
+        chooser.setTitle("选择数据导出目录");
+        java.io.File selected = chooser.showDialog(primaryStage);
+        if (selected != null && exportDirField != null) {
+            exportDirField.setText(selected.getAbsolutePath());
+        }
+    }
+
+    private void loadRemoteProfilesAsyncV2() {
+        ioExecutor.submit(() -> {
+            try {
+                List<MonitorListenerProfile> items = monitorConfigApiClient.listProfiles(appState.getToken(), localMacAddress);
+                Platform.runLater(() -> {
+                    for (MonitorListenerProfile item : items) {
+                        if (item != null) {
+                            listenerProfileCache.put(item.getProtocolType(), cloneProfile(item));
+                        }
+                    }
+                    applyProfileToForm(getOrCreateProfile(protocolTypeCombo == null ? MonitorProtocolType.HL7 : protocolTypeCombo.getValue()));
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText(items.isEmpty()
+                            ? "未读取到服务端监听配置，当前使用默认配置。"
+                            : "已读取服务端监听配置。");
+                    }
+                    updateConfigEditStateV2();
+                });
+            } catch (Exception ex) {
+                appendLog("读取服务端监听配置失败: " + ex.getMessage());
+                Platform.runLater(() -> {
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("读取服务端监听配置失败，当前使用本地默认配置。");
+                    }
+                });
+            }
+        });
+    }
+
+    private void handleSerialProtocolMessage(MonitorProtocolType protocolType, String portName, String payload) {
+        if (payload == null || payload.isBlank()) {
+            return;
+        }
+        String text = payload.trim();
+        if (text.startsWith("MSH")) {
+            handleHl7Message(new MllpServer.MessageContext(
+                0,
+                protocolType.getCode() + ":" + valueOrDefault(portName, "-"),
+                valueOrDefault(portName, protocolType.getCode()),
+                0,
+                text
+            ));
+            return;
+        }
+        appendLog(protocolType.getDisplayName() + "收到原始数据: " + text);
+        store.saveRuntimeEvent(protocolType.getCode(), "INFO", valueOrDefault(portName, "serial"), text, null);
+    }
+
+    private void persistProfileToLocalConfig(MonitorListenerProfile profile) {
+        if (profile == null) {
+            return;
+        }
+        config.set("clientCode", valueOrDefault(profile.getClientCode(), generatedClientCode));
+        config.set("orgCode", valueOrDefault(profile.getOrgCode(), appState.getCurrentOrgCode()));
+        config.set("listenerProtocol", profile.getProtocolType().getCode());
+        config.set("exportDir", valueOrDefault(profile.getExportDir(), "./exports"));
+        config.set("syncIntervalSec", String.valueOf(profile.getSyncIntervalSec()));
+        config.set("heartbeatIntervalSec", String.valueOf(profile.getHeartbeatIntervalSec()));
+        if (profile.getListenPort() != null) {
+            config.set("hl7ListenerPort", String.valueOf(profile.getListenPort()));
+        }
+        config.set("serialPortName", valueOrDefault(profile.getSerialPortName(), "COM1"));
+        config.set("serialBaudRate", String.valueOf(profile.getBaudRate() == null ? 9600 : profile.getBaudRate()));
+        config.set("serialDataBits", String.valueOf(profile.getDataBits() == null ? 8 : profile.getDataBits()));
+        config.set("serialStopBits", String.valueOf(profile.getStopBits() == null ? 1 : profile.getStopBits()));
+        config.set("serialParity", valueOrDefault(profile.getParity(), "NONE"));
+        config.set("serialReadTimeoutMs", String.valueOf(profile.getReadTimeoutMs() == null ? 1000 : profile.getReadTimeoutMs()));
+        config.set("serialPollIntervalMs", String.valueOf(profile.getPollIntervalMs() == null ? 500 : profile.getPollIntervalMs()));
+        config.set("serialCharset", valueOrDefault(profile.getCharsetName(), "UTF-8"));
+        config.set("serialFrameDelimiter", valueOrDefault(profile.getFrameDelimiter(), "CRLF"));
+        config.set("rs485StationNo", valueOrDefault(profile.getStationNo(), "1"));
+        if (orgCodeField != null) {
+            orgCodeField.setText(valueOrDefault(profile.getOrgCode(), ""));
+        }
+        if (profile.getOrgCode() != null) {
+            appState.selectAuthorizedOrg(profile.getOrgCode());
+        }
+    }
+
+    private MonitorListenerProfile cloneProfile(MonitorListenerProfile source) {
+        if (source == null) {
+            return null;
+        }
+        MonitorListenerProfile target = new MonitorListenerProfile();
+        target.setId(source.getId());
+        target.setClientCode(source.getClientCode());
+        target.setMacAddress(source.getMacAddress());
+        target.setProtocolType(source.getProtocolType());
+        target.setOrgCode(source.getOrgCode());
+        target.setOrgName(source.getOrgName());
+        target.setExportDir(source.getExportDir());
+        target.setSyncIntervalSec(source.getSyncIntervalSec());
+        target.setHeartbeatIntervalSec(source.getHeartbeatIntervalSec());
+        target.setListenPort(source.getListenPort());
+        target.setSerialPortName(source.getSerialPortName());
+        target.setBaudRate(source.getBaudRate());
+        target.setDataBits(source.getDataBits());
+        target.setStopBits(source.getStopBits());
+        target.setParity(source.getParity());
+        target.setReadTimeoutMs(source.getReadTimeoutMs());
+        target.setPollIntervalMs(source.getPollIntervalMs());
+        target.setCharsetName(source.getCharsetName());
+        target.setFrameDelimiter(source.getFrameDelimiter());
+        target.setStationNo(source.getStationNo());
+        target.setExtJson(source.getExtJson());
+        return target;
+    }
+
+    private void showAboutDialog() {
+        OrgInfo orgInfo = appState == null ? null : appState.getCurrentOrgInfo();
+        String orgDisplay = appState == null
+            ? "-"
+            : joinText(appState.getCurrentOrgCode(), orgInfo == null ? null : orgInfo.getOrgName(), " / ");
+        String content = "系统名称: 寅米医疗器械接入终端软件"
+            + System.lineSeparator() + "当前版本: " + appState.getAppVersion()
+            + System.lineSeparator() + "应用编码: " + valueOrDefault(config.get("appUpgradeCode"), "InMeHL7MonitorClient")
+            + System.lineSeparator() + "客户端编号: " + valueOrDefault(generatedClientCode, "-")
+            + System.lineSeparator() + "本机 MAC: " + valueOrDefault(localMacAddress, "-")
+            + System.lineSeparator() + "授权机构: " + valueOrDefault(orgDisplay, "-");
+        showAlert(Alert.AlertType.INFORMATION, "关于", content);
+    }
+
+    private void checkForUpdateAsync() {
+        if (configStatusLabel != null) {
+            configStatusLabel.setText("正在检查最新版本...");
+        }
+        ioExecutor.submit(() -> {
+            try {
+                VersionInfo info = fetchLatestVersionInfo();
+                Platform.runLater(() -> handleVersionInfo(info));
+            } catch (Exception ex) {
+                appendLog("检查版本升级失败: " + ex.getMessage());
+                Platform.runLater(() -> {
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("检查版本升级失败。");
+                    }
+                    showAlert(Alert.AlertType.ERROR, "检查升级失败", valueOrDefault(ex.getMessage(), "无法获取版本信息"));
+                });
+            }
+        });
+    }
+
+    private VersionInfo fetchLatestVersionInfo() throws IOException, InterruptedException {
+        String baseUrl = valueOrDefault(config.get("appBaseUrl"), "https://hisplus.zhunyintech.com");
+        String appCode = valueOrDefault(config.get("appUpgradeCode"), "InMeHL7MonitorClient");
+        String url = trimTrailingSlash(baseUrl) + "/api/zyhisplus/v1/appversion/latest/" + appCode;
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .timeout(Duration.ofSeconds(15))
+            .header("accept", "application/json, */*")
+            .GET();
+        applyTokenHeaders(builder, appState == null ? null : appState.getToken());
+        appendLog("HTTP GET " + url);
+        HttpResponse<String> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        appendLog("HTTP GET " + url + " -> " + response.statusCode());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("GET " + url + " -> HTTP " + response.statusCode() + " " + response.body());
+        }
+        JsonNode root = mapper.readTree(response.body());
+        JsonNode codeNode = root.get("code");
+        if (codeNode != null && codeNode.asInt(0) != 0) {
+            throw new IOException(valueOrDefault(text(root, "message"), valueOrDefault(text(root, "errMessage"), "无法获取版本信息")));
+        }
+        JsonNode node = unwrapVersionNode(root.has("data") ? root.path("data") : root);
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return new VersionInfo(appState.getAppVersion(), null, false, null);
+        }
+        return new VersionInfo(
+            valueOrDefault(text(node, "version"), appState.getAppVersion()),
+            text(node, "fileUrl"),
+            node.path("forceUpdate").asBoolean(false),
+            valueOrDefault(text(node, "description"), text(node, "remark"))
+        );
+    }
+
+    private void handleVersionInfo(VersionInfo info) {
+        String currentVersion = appState.getAppVersion();
+        if (info == null || valueOrDefault(info.version(), "").isBlank() || currentVersion.equals(info.version())) {
+            if (configStatusLabel != null) {
+                configStatusLabel.setText("当前已是最新版本。");
+            }
+            showAlert(Alert.AlertType.INFORMATION, "版本升级", "当前版本为 " + currentVersion + "，暂无新版本。");
+            return;
+        }
+        StringBuilder content = new StringBuilder();
+        content.append("当前版本: ").append(currentVersion).append(System.lineSeparator());
+        content.append("最新版本: ").append(info.version()).append(System.lineSeparator());
+        if (!valueOrDefault(info.description(), "").isBlank()) {
+            content.append("更新说明: ").append(info.description()).append(System.lineSeparator());
+        }
+        content.append(System.lineSeparator()).append("是否立即下载并升级？");
+        Alert alert = new Alert(info.forceUpdate() ? Alert.AlertType.WARNING : Alert.AlertType.CONFIRMATION);
+        alert.setTitle("版本升级");
+        alert.setHeaderText("发现新版本 " + info.version());
+        alert.setContentText(content.toString());
+        if (primaryStage != null) {
+            alert.initOwner(primaryStage);
+        }
+        if (alert.showAndWait().orElse(ButtonType.CANCEL) == ButtonType.OK) {
+            downloadUpdateAsync(info);
+        } else if (configStatusLabel != null) {
+            configStatusLabel.setText("已取消版本升级。");
+        }
+    }
+
+    private void downloadUpdateAsync(VersionInfo info) {
+        if (info == null || valueOrDefault(info.fileUrl(), "").isBlank()) {
+            showAlert(Alert.AlertType.ERROR, "版本升级", "当前版本未配置下载地址。");
+            return;
+        }
+        if (configStatusLabel != null) {
+            configStatusLabel.setText("正在下载升级包...");
+        }
+        ioExecutor.submit(() -> {
+            try {
+                Path target = downloadUpdatePackage(info.fileUrl());
+                appendLog("升级包已下载: " + target);
+                Platform.runLater(() -> {
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("升级包已下载完成。");
+                    }
+                    if (isInstaller(target)) {
+                        if (launchInstaller(target)) {
+                            showAlert(Alert.AlertType.INFORMATION, "版本升级", "安装程序已启动，请按提示完成升级。");
+                            Platform.exit();
+                        } else {
+                            showAlert(Alert.AlertType.ERROR, "版本升级", "升级包已下载，但无法自动启动安装程序。");
+                            openExportLocation(target);
+                        }
+                    } else {
+                        showAlert(Alert.AlertType.INFORMATION, "版本升级",
+                            "升级包已下载到:\n" + target.toAbsolutePath() + "\n请在安装或替换完成后重新启动客户端。");
+                        openExportLocation(target);
+                    }
+                });
+            } catch (Exception ex) {
+                appendLog("下载升级包失败: " + ex.getMessage());
+                Platform.runLater(() -> {
+                    if (configStatusLabel != null) {
+                        configStatusLabel.setText("下载升级包失败。");
+                    }
+                    showAlert(Alert.AlertType.ERROR, "版本升级", valueOrDefault(ex.getMessage(), "下载升级包失败"));
+                });
+            }
+        });
+    }
+
+    private Path downloadUpdatePackage(String fileUrl) throws IOException, InterruptedException {
+        Path target = resolveUpdateFileTarget(fileUrl);
+        Files.createDirectories(target.getParent());
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(fileUrl))
+            .timeout(Duration.ofMinutes(5))
+            .GET()
+            .build();
+        HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("GET " + fileUrl + " -> HTTP " + response.statusCode());
+        }
+        Files.write(target, response.body());
+        return target;
+    }
+
+    private Path resolveUpdateFileTarget(String fileUrl) {
+        String local = System.getenv("LOCALAPPDATA");
+        if (local == null || local.isBlank()) {
+            local = System.getProperty("user.home");
+        }
+        return Paths.get(local, "InMeHL7MonitorClient", "updates", resolveFileName(fileUrl));
+    }
+
+    private String resolveFileName(String fileUrl) {
+        if (fileUrl == null || fileUrl.isBlank()) {
+            return "InMeHL7MonitorClient-Update.bin";
+        }
+        String clean = fileUrl;
+        int index = clean.indexOf('?');
+        if (index >= 0) {
+            clean = clean.substring(0, index);
+        }
+        int slash = clean.lastIndexOf('/');
+        String name = slash >= 0 ? clean.substring(slash + 1) : clean;
+        return name == null || name.isBlank() ? "InMeHL7MonitorClient-Update.bin" : name;
+    }
+
+    private boolean isInstaller(Path target) {
+        if (target == null) {
+            return false;
+        }
+        String lower = target.getFileName().toString().toLowerCase();
+        return lower.endsWith(".exe") || lower.endsWith(".msi");
+    }
+
+    private boolean launchInstaller(Path installer) {
+        try {
+            new ProcessBuilder("cmd", "/c", "start", "\"\"", installer.toAbsolutePath().toString()).start();
+            return true;
+        } catch (Exception ex) {
+            appendLog("启动安装程序失败: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    private JsonNode unwrapVersionNode(JsonNode node) {
+        JsonNode current = node;
+        for (int i = 0; i < 3; i++) {
+            if (current == null || current.isNull() || current.isMissingNode()) {
+                return current;
+            }
+            if (current.has("version")) {
+                return current;
+            }
+            if (current.isArray()) {
+                return current.size() > 0 ? current.get(0) : current;
+            }
+            JsonNode records = current.path("records");
+            if (records.isArray() && records.size() > 0) {
+                return records.get(0);
+            }
+            JsonNode content = current.path("content");
+            if (content.isArray() && content.size() > 0) {
+                return content.get(0);
+            }
+            JsonNode next = current.path("data");
+            if (next.isMissingNode() || next.isNull() || next == current) {
+                return current;
+            }
+            current = next;
+        }
+        return current;
+    }
+
+    private void applyTokenHeaders(HttpRequest.Builder builder, String token) {
+        if (builder == null || token == null || token.isBlank()) {
+            return;
+        }
+        String tokenValue = token.trim();
+        String headerName = valueOrDefault(config.get("authHeaderName"), "x-auth-token");
+        String mode = valueOrDefault(config.get("authHeaderMode"), "auto").trim().toLowerCase();
+        if ("auto".equals(mode)) {
+            mode = looksLikeJwt(tokenValue) ? "authorization" : "x-auth-token";
+        }
+        if ("both".equals(mode)) {
+            builder.header("Authorization", "Bearer " + tokenValue);
+            builder.header(headerName, tokenValue);
+            if (!"x-auth-token".equalsIgnoreCase(headerName)) {
+                builder.header("x-auth-token", tokenValue);
+            }
+            return;
+        }
+        if ("authorization".equals(mode) || "bearer".equals(mode)) {
+            builder.header("Authorization", "Bearer " + tokenValue);
+            return;
+        }
+        builder.header(headerName, tokenValue);
+    }
+
+    private boolean looksLikeJwt(String tokenValue) {
+        int firstDot = tokenValue.indexOf('.');
+        return firstDot > 0 && tokenValue.indexOf('.', firstDot + 1) > firstDot + 1;
+    }
+
+    private String trimTrailingSlash(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String text = value.trim();
+        return text.endsWith("/") ? text.substring(0, text.length() - 1) : text;
+    }
+
+    private String text(JsonNode node, String field) {
+        if (node == null || field == null || node.get(field) == null || node.get(field).isNull()) {
+            return null;
+        }
+        String value = node.get(field).asText();
+        return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    private void showAlert(Alert.AlertType type, String title, String message) {
+        Alert alert = new Alert(type);
+        alert.setTitle(title);
+        alert.setHeaderText(null);
+        alert.setContentText(valueOrDefault(message, ""));
+        if (primaryStage != null) {
+            alert.initOwner(primaryStage);
+        }
+        alert.showAndWait();
+    }
+
     private void saveConfig() {
         config.set("ssoBaseUrl", valueFromFieldOrConfig(ssoBaseUrlField, "ssoBaseUrl"));
         config.set("ssoAppId", valueFromFieldOrConfig(ssoAppIdField, "ssoAppId"));
@@ -1062,8 +2129,8 @@ public class InmeHl7ClientApplication extends Application {
             DeviceRegistry saved = repository.saveDevice(device);
             appendLog("设备已保存: " + (saved == null ? device.getDeviceId() : saved.getDisplayName()));
             refreshDevicesAsync();
-            if (listenerManager != null && listenerManager.isRunning()) {
-                startListeners();
+            if (isAnyListenerRunning()) {
+                startMonitorListeners();
             }
         });
     }
@@ -1491,6 +2558,9 @@ public class InmeHl7ClientApplication extends Application {
 
     private String valueOrDefault(String value, String defaultValue) {
         return value == null || value.trim().isEmpty() ? defaultValue : value.trim();
+    }
+
+    private record VersionInfo(String version, String fileUrl, boolean forceUpdate, String description) {
     }
 
     public static void main(String[] args) {
